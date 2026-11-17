@@ -265,21 +265,66 @@ describe("token repository discovery", () => {
     );
   });
 
-  it("refuses partial discovery beyond the page bound", async () => {
-    const request = vi.fn<typeof fetch>().mockImplementation(async () =>
-      Response.json([apiRepository], {
+  it("finds a scoped match beyond 1,000 repositories and stops when enough match", async () => {
+    const unrelated = Array.from({ length: 100 }, () => ({
+      ...apiRepository,
+      name: "unrelated",
+      full_name: "octo/unrelated",
+      description: null,
+    }));
+    let page = 0;
+    const request = vi.fn<typeof fetch>().mockImplementation(async () => {
+      page++;
+      return Response.json(page <= 10 ? unrelated : [apiRepository], {
         headers: { link: '<https://api.github.com/user/repos?page=2>; rel="next"' },
-      }),
-    );
+      });
+    });
     const service = createGitHubService({
       resolveRepositoryToken: async () => "test-token",
       resolveGhPath: async () => null,
       repositoryFetch: request,
     });
-    await expect(service.searchRepositories({ cwd: "/tmp", query: "" })).rejects.toThrow(
-      "exceeded 1,000 repositories",
-    );
-    expect(request).toHaveBeenCalledTimes(10);
+    const result = await service.searchRepositories({ cwd: "/tmp", query: "private", limit: 1 });
+    expect(result.map((repo) => repo.id)).toEqual(["R_private"]);
+    expect(request).toHaveBeenCalledTimes(11);
+  });
+
+  it("fails clearly and cancels discovery when its deadline expires", async () => {
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    const request = vi.fn<typeof fetch>().mockImplementation(async (_url, init) => {
+      controller.abort();
+      init?.signal?.throwIfAborted();
+      throw new Error("unreachable");
+    });
+    try {
+      const service = createGitHubService({
+        resolveRepositoryToken: async () => "test-token",
+        resolveGhPath: async () => null,
+        repositoryFetch: request,
+      });
+      await expect(service.searchRepositories({ cwd: "/tmp", query: "private" })).rejects.toThrow(
+        "timed out before completion",
+      );
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(controller.signal.aborted).toBe(true);
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
+  it("keeps an empty scoped search authoritative when gh is available", async () => {
+    const runner = createRunner(["https"]);
+    const service = createGitHubService({
+      resolveRepositoryToken: async () => "selected-repositories-token",
+      resolveGhPath: async () => "/usr/bin/gh",
+      runner: runner.runner,
+      repositoryFetch: async () => Response.json([apiRepository]),
+    });
+    await expect(
+      service.searchRepositories({ cwd: "/tmp", query: "other-public-project" }),
+    ).resolves.toEqual([]);
+    expect(runner.calls.map((call) => call.args[0])).toEqual(["config"]);
   });
 });
 

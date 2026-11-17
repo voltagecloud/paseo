@@ -2354,6 +2354,10 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
       const limit = input.limit ?? 20;
       const query = input.query.trim();
       const token = await (options.resolveRepositoryToken ?? resolveRepositoryToken)(input.cwd);
+      // REST discovery intentionally searches only /user/repos, including typed
+      // queries. A selected-repository credential must not turn into global
+      // public search when its scoped listing is empty. Only absence of a REST
+      // credential selects the legacy gh search below; HTTP errors stay errors.
       if (token) {
         let cloneProtocol: GitHubCloneProtocol = "https";
         try {
@@ -2368,7 +2372,12 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
         } catch {
           // Optional CLI configuration must not block a valid API credential.
         }
-        const repositories = await listTokenRepositories(token, options.repositoryFetch ?? fetch);
+        const repositories = await listTokenRepositories(
+          token,
+          options.repositoryFetch ?? fetch,
+          query,
+          limit,
+        );
         const needle = query.toLowerCase();
         return repositories
           .filter((repo) =>
@@ -4379,12 +4388,20 @@ const TokenRepositorySchema = z.object({
   clone_url: z.string(),
 });
 
-async function listTokenRepositories(token: string, request: typeof fetch) {
+async function listTokenRepositories(
+  token: string,
+  request: typeof fetch,
+  query: string,
+  limit: number,
+) {
   const repositories: z.infer<typeof TokenRepositorySchema>[] = [];
   const signal = AbortSignal.timeout(15_000);
-  // Bound discovery at 1,000 repositories. Refuse partial results instead of
-  // making a repository past the cap appear inaccessible.
-  for (let page = 1; page <= 10; page++) {
+  // A successful scoped listing is authoritative, even for nonempty queries.
+  // Never broaden discovery beyond the repositories visible to this credential.
+  const needle = query.toLowerCase();
+  for (let page = 1; ; page++) {
+    if (signal.aborted)
+      throw new Error("GitHub repository search timed out before completion. Retry the search.");
     let response: Response;
     try {
       response = await request(
@@ -4400,6 +4417,8 @@ async function listTokenRepositories(token: string, request: typeof fetch) {
         },
       );
     } catch {
+      if (signal.aborted)
+        throw new Error("GitHub repository search timed out before completion. Retry the search.");
       throw new Error(
         "GitHub repository listing failed. Check the host network connection and retry.",
       );
@@ -4431,16 +4450,22 @@ async function listTokenRepositories(token: string, request: typeof fetch) {
       const parsed = z
         .array(TokenRepositorySchema)
         .parse(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-      repositories.push(...parsed);
+      repositories.push(
+        ...parsed.filter((repo) =>
+          [repo.name, repo.full_name, repo.description ?? ""].some((value) =>
+            value.toLowerCase().includes(needle),
+          ),
+        ),
+      );
     } catch {
       await reader.cancel().catch(() => undefined);
+      if (signal.aborted)
+        throw new Error("GitHub repository search timed out before completion. Retry the search.");
       throw new Error("GitHub returned an invalid or incomplete repository response.");
     } finally {
       reader.releaseLock();
     }
-    if (!response.headers.get("link")?.includes('rel="next"')) return repositories;
+    if (repositories.length >= limit || !response.headers.get("link")?.includes('rel="next"'))
+      return repositories.slice(0, limit);
   }
-  throw new Error(
-    "GitHub repository discovery exceeded 1,000 repositories. Enter the repository URL directly.",
-  );
 }
