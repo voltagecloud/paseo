@@ -15,6 +15,7 @@ import { spawnProcess } from "./spawn.js";
 import {
   GitProcessScheduler,
   type GitProcessPriority,
+  type ScheduledGitProcess,
   resolveGitProcessPolicy,
   type GitProcessPolicy,
 } from "./git-process-scheduler.js";
@@ -26,6 +27,10 @@ const DEFAULT_STDERR_LIMIT = 2048;
 let gitProcessScheduler = new GitProcessScheduler(resolveGitProcessPolicy({ env: process.env }));
 let gitRuntimeMetrics = createGitCommandRuntimeMetricsWindow(gitProcessScheduler.policy);
 const gitCommandPriority = new AsyncLocalStorage<GitProcessPriority>();
+
+export function scheduleGitProcess<T>(start: () => ScheduledGitProcess<T>): Promise<T> {
+  return gitProcessScheduler.run(start, { priority: "normal" });
+}
 
 export function runWithGitCommandPriority<T>(priority: GitProcessPriority, operation: () => T): T {
   return gitCommandPriority.run(priority, operation);

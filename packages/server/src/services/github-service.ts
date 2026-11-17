@@ -1,3 +1,4 @@
+import { scheduleGitProcess } from "../utils/run-git-command.js";
 import { z } from "zod";
 import {
   isGitHubHost,
@@ -4313,66 +4314,74 @@ function mapReviewDecision(value: unknown): PullRequestReviewDecision {
 // Host-only discovery cannot use credentials restricted to a repository path.
 // Never manufacture a path: those installations can explicitly set GH_TOKEN.
 export async function resolveRepositoryToken(cwd: string): Promise<string | null> {
-  const password = await new Promise<string | null>((resolve) => {
-    const spawnCredential =
-      process.platform === "win32" ? spawnWindowsCredentialProcess : spawnProcess;
-    const child = spawnCredential("git", ["credential", "fill"], {
-      cwd,
-      shell: false,
-      detached: process.platform !== "win32",
-      envOverlay: {
-        GIT_TERMINAL_PROMPT: "0",
-        GIT_ASKPASS: "",
-        SSH_ASKPASS: "",
-        GCM_INTERACTIVE: "never",
-      },
-      stdio: ["pipe", "pipe", "ignore"],
+  const password = await scheduleGitProcess(() => {
+    let markExited!: () => void;
+    const exited = new Promise<void>((resolve) => {
+      markExited = resolve;
     });
-    let output = "";
-    let settled = false;
-    const deadline = setTimeout(stop, 5_000);
-    function finish(credential: string | null) {
-      if (settled) return;
-      settled = true;
-      clearTimeout(deadline);
-      output = "";
-      child.stdout?.destroy();
-      child.stdin?.destroy();
-      // eslint-disable-next-line promise/no-multiple-resolved -- The settled guard makes this shared event callback idempotent.
-      resolve(credential);
-    }
-    function stop() {
-      // Settlement must not wait for close: a helper can inherit the pipe.
-      if (settled) return;
-      if (process.platform !== "win32" && child.pid) {
-        // A group also contains pipe holders whose intermediate parent exited.
-        try {
-          process.kill(-child.pid, "SIGKILL");
-        } catch {
-          void signalProcessTree(child, "SIGKILL");
-        }
-      } else {
-        // Terminating the Windows launcher closes its sole Job Object handle.
-        child.kill("SIGKILL");
+    const result = new Promise<string | null>((resolve) => {
+      const spawnCredential =
+        process.platform === "win32" ? spawnWindowsCredentialProcess : spawnProcess;
+      const child = spawnCredential("git", ["credential", "fill"], {
+        cwd,
+        shell: false,
+        detached: process.platform !== "win32",
+        envOverlay: {
+          GIT_TERMINAL_PROMPT: "0",
+          GIT_ASKPASS: "",
+          SSH_ASKPASS: "",
+          GCM_INTERACTIVE: "never",
+        },
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+      child.once("close", markExited);
+      let output = "";
+      let settled = false;
+      const deadline = setTimeout(stop, 5_000);
+      function finish(credential: string | null) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        output = "";
+        child.stdout?.destroy();
+        child.stdin?.destroy();
+        // eslint-disable-next-line promise/no-multiple-resolved -- The settled guard makes this shared event callback idempotent.
+        resolve(credential);
       }
-      finish(null);
-    }
-    child.stdout?.on("data", (chunk: Buffer) => {
-      if (settled) return;
-      output += chunk.toString("utf8");
-      if (Buffer.byteLength(output) > 16_384) stop();
+      function stop() {
+        // Settlement must not wait for close: a helper can inherit the pipe.
+        if (settled) return;
+        if (process.platform !== "win32" && child.pid) {
+          // A group also contains pipe holders whose intermediate parent exited.
+          try {
+            process.kill(-child.pid, "SIGKILL");
+          } catch {
+            void signalProcessTree(child, "SIGKILL");
+          }
+        } else {
+          // Terminating the Windows launcher closes its sole Job Object handle.
+          child.kill("SIGKILL");
+        }
+        finish(null);
+      }
+      child.stdout?.on("data", (chunk: Buffer) => {
+        if (settled) return;
+        output += chunk.toString("utf8");
+        if (Buffer.byteLength(output) > 16_384) stop();
+      });
+      child.on("error", stop);
+      child.stdin?.on("error", stop);
+      child.on("close", (code) => {
+        if (settled) return;
+        if (code !== 0) return finish(null);
+        const line = output.split("\n").find((entry) => entry.startsWith("password="));
+        finish(line?.slice("password=".length).trim() || null);
+      });
+      if (process.platform !== "win32") {
+        child.stdin?.end("protocol=https\nhost=github.com\n\n");
+      }
     });
-    child.on("error", stop);
-    child.stdin?.on("error", stop);
-    child.on("close", (code) => {
-      if (settled) return;
-      if (code !== 0) return finish(null);
-      const line = output.split("\n").find((entry) => entry.startsWith("password="));
-      finish(line?.slice("password=".length).trim() || null);
-    });
-    if (process.platform !== "win32") {
-      child.stdin?.end("protocol=https\nhost=github.com\n\n");
-    }
+    return { result, exited };
   });
   return password || process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim() || null;
 }
@@ -4399,9 +4408,9 @@ async function listTokenRepositories(
   // A successful scoped listing is authoritative, even for nonempty queries.
   // Never broaden discovery beyond the repositories visible to this credential.
   const needle = query.toLowerCase();
+  const seen = new Set<string>();
   for (let page = 1; ; page++) {
-    if (signal.aborted)
-      throw new Error("GitHub repository search timed out before completion. Retry the search.");
+    checkRepositoryDeadline(signal);
     let response: Response;
     try {
       response = await request(
@@ -4417,20 +4426,19 @@ async function listTokenRepositories(
         },
       );
     } catch {
-      if (signal.aborted)
-        throw new Error("GitHub repository search timed out before completion. Retry the search.");
+      checkRepositoryDeadline(signal);
       throw new Error(
         "GitHub repository listing failed. Check the host network connection and retry.",
       );
     }
     if (response.status === 401) {
-      await response.body?.cancel();
+      await response.body?.cancel().catch(() => undefined);
       throw new GitHubAuthenticationError({
         stderr: "GitHub rejected the configured repository credential.",
       });
     }
     if (!response.ok) {
-      await response.body?.cancel();
+      await response.body?.cancel().catch(() => undefined);
       throw new Error(
         `GitHub repository listing failed (HTTP ${response.status}). Check token access and rate limits.`,
       );
@@ -4450,17 +4458,20 @@ async function listTokenRepositories(
       const parsed = z
         .array(TokenRepositorySchema)
         .parse(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-      repositories.push(
-        ...parsed.filter((repo) =>
+      for (const repo of parsed) {
+        if (seen.has(repo.node_id)) continue;
+        if (
           [repo.name, repo.full_name, repo.description ?? ""].some((value) =>
             value.toLowerCase().includes(needle),
-          ),
-        ),
-      );
+          )
+        ) {
+          seen.add(repo.node_id);
+          repositories.push(repo);
+        }
+      }
     } catch {
       await reader.cancel().catch(() => undefined);
-      if (signal.aborted)
-        throw new Error("GitHub repository search timed out before completion. Retry the search.");
+      checkRepositoryDeadline(signal);
       throw new Error("GitHub returned an invalid or incomplete repository response.");
     } finally {
       reader.releaseLock();
@@ -4468,4 +4479,9 @@ async function listTokenRepositories(
     if (repositories.length >= limit || !response.headers.get("link")?.includes('rel="next"'))
       return repositories.slice(0, limit);
   }
+}
+
+function checkRepositoryDeadline(signal: AbortSignal): void {
+  if (signal.aborted)
+    throw new Error("GitHub repository search timed out before completion. Retry the search.");
 }

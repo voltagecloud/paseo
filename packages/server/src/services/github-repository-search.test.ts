@@ -313,6 +313,46 @@ describe("token repository discovery", () => {
     }
   });
 
+  it("counts distinct matches across changing pages", async () => {
+    const request = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json([apiRepository], {
+          headers: { link: '<https://api.github.com/user/repos?page=2>; rel="next"' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json([apiRepository], {
+          headers: { link: '<https://api.github.com/user/repos?page=3>; rel="next"' },
+        }),
+      )
+      .mockResolvedValueOnce(Response.json([{ ...apiRepository, node_id: "R_second" }]));
+    const service = createGitHubService({
+      resolveRepositoryToken: async () => "test-token",
+      resolveGhPath: async () => null,
+      repositoryFetch: request,
+    });
+    const result = await service.searchRepositories({ cwd: "/tmp", query: "private", limit: 2 });
+    expect(result.map((repo) => repo.id)).toEqual(["R_private", "R_second"]);
+    expect(request).toHaveBeenCalledTimes(3);
+  });
+
+  it("preserves HTTP authentication classification when body cancellation rejects", async () => {
+    const body = new ReadableStream({
+      start(controller) {
+        controller.error(new Error("sensitive"));
+      },
+    });
+    const service = createGitHubService({
+      resolveRepositoryToken: async () => "test-token",
+      resolveGhPath: async () => null,
+      repositoryFetch: async () => new Response(body, { status: 401 }),
+    });
+    await expect(
+      service.searchRepositories({ cwd: "/tmp", query: "private" }),
+    ).rejects.toBeInstanceOf(GitHubAuthenticationError);
+  });
+
   it("keeps an empty scoped search authoritative when gh is available", async () => {
     const runner = createRunner(["https"]);
     const service = createGitHubService({
