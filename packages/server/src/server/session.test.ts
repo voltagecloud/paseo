@@ -1059,7 +1059,8 @@ describe("project command-center RPCs", () => {
         reason: "gh_missing",
         repositories: [],
         available: false,
-        error: "GitHub CLI (gh) is not installed or not in PATH",
+        error:
+          "GitHub repository search is unavailable. Configure git credentials for github.com or set GH_TOKEN/GITHUB_TOKEN on the host.",
       },
     },
     {
@@ -1069,7 +1070,8 @@ describe("project command-center RPCs", () => {
         requestId: "req-repositories-error",
         repositories: [],
         available: false,
-        error: "GitHub CLI is not authenticated. Run gh auth login on the host.",
+        error:
+          "GitHub authentication failed. Check git credentials for github.com, GH_TOKEN/GITHUB_TOKEN, or run gh auth login on the host.",
       },
     },
     {

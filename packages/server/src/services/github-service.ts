@@ -11,7 +11,9 @@ import {
   buildForkLocalBranchName,
   buildPullHeadCheckoutRefs,
 } from "../utils/change-request-checkout.js";
-import { execCommand } from "../utils/spawn.js";
+import { execCommand, spawnProcess } from "../utils/spawn.js";
+import { spawnWindowsCredentialProcess } from "../utils/windows-job-process.js";
+import { signalProcessTree } from "../utils/tree-kill.js";
 import { resolveSshHostname } from "../utils/ssh-hostname.js";
 import {
   CLI_AUTH_PROBE_TIMEOUT_MS,
@@ -1051,6 +1053,8 @@ export class GitHubEnterpriseHostProbeError extends Error {
 
 interface CreateGitHubServiceOptions {
   ttlMs?: number;
+  resolveRepositoryToken?: (cwd: string) => Promise<string | null>;
+  repositoryFetch?: typeof fetch;
   runner?: GitHubCommandRunner;
   resolveGhPath?: () => Promise<string | null>;
   now?: () => number;
@@ -2349,6 +2353,42 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
     async searchRepositories(input) {
       const limit = input.limit ?? 20;
       const query = input.query.trim();
+      const token = await (options.resolveRepositoryToken ?? resolveRepositoryToken)(input.cwd);
+      if (token) {
+        let cloneProtocol: GitHubCloneProtocol = "https";
+        try {
+          if (await deps.resolveGhPath()) {
+            // This preference belongs to github.com, not the cwd's origin host.
+            const { stdout } = await deps.runner(
+              ["config", "get", "git_protocol", "--host", "github.com"],
+              { cwd: input.cwd },
+            );
+            if (stdout.trim().toLowerCase() === "ssh") cloneProtocol = "ssh";
+          }
+        } catch {
+          // Optional CLI configuration must not block a valid API credential.
+        }
+        const repositories = await listTokenRepositories(token, options.repositoryFetch ?? fetch);
+        const needle = query.toLowerCase();
+        return repositories
+          .filter((repo) =>
+            [repo.name, repo.full_name, repo.description ?? ""].some((value) =>
+              value.toLowerCase().includes(needle),
+            ),
+          )
+          .slice(0, limit)
+          .map((repo) =>
+            normalizeRepositorySummary({
+              id: repo.node_id,
+              name: repo.name,
+              nameWithOwner: repo.full_name,
+              description: repo.description,
+              isPrivate: repo.private,
+              updatedAt: repo.updated_at,
+              cloneUrl: cloneProtocol === "ssh" ? repo.ssh_url : repo.clone_url,
+            }),
+          );
+      }
       if (query.length === 0) {
         const [stdout, cloneProtocol] = await Promise.all([
           run(
@@ -4259,4 +4299,148 @@ function mapReviewDecision(value: unknown): PullRequestReviewDecision {
     return "pending";
   }
   return null;
+}
+
+// Host-only discovery cannot use credentials restricted to a repository path.
+// Never manufacture a path: those installations can explicitly set GH_TOKEN.
+export async function resolveRepositoryToken(cwd: string): Promise<string | null> {
+  const password = await new Promise<string | null>((resolve) => {
+    const spawnCredential =
+      process.platform === "win32" ? spawnWindowsCredentialProcess : spawnProcess;
+    const child = spawnCredential("git", ["credential", "fill"], {
+      cwd,
+      shell: false,
+      detached: process.platform !== "win32",
+      envOverlay: {
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_ASKPASS: "",
+        SSH_ASKPASS: "",
+        GCM_INTERACTIVE: "never",
+      },
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    let output = "";
+    let settled = false;
+    const deadline = setTimeout(stop, 5_000);
+    function finish(credential: string | null) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      output = "";
+      child.stdout?.destroy();
+      child.stdin?.destroy();
+      // eslint-disable-next-line promise/no-multiple-resolved -- The settled guard makes this shared event callback idempotent.
+      resolve(credential);
+    }
+    function stop() {
+      // Settlement must not wait for close: a helper can inherit the pipe.
+      if (settled) return;
+      if (process.platform !== "win32" && child.pid) {
+        // A group also contains pipe holders whose intermediate parent exited.
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          void signalProcessTree(child, "SIGKILL");
+        }
+      } else {
+        // Terminating the Windows launcher closes its sole Job Object handle.
+        child.kill("SIGKILL");
+      }
+      finish(null);
+    }
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      output += chunk.toString("utf8");
+      if (Buffer.byteLength(output) > 16_384) stop();
+    });
+    child.on("error", stop);
+    child.stdin?.on("error", stop);
+    child.on("close", (code) => {
+      if (settled) return;
+      if (code !== 0) return finish(null);
+      const line = output.split("\n").find((entry) => entry.startsWith("password="));
+      finish(line?.slice("password=".length).trim() || null);
+    });
+    if (process.platform !== "win32") {
+      child.stdin?.end("protocol=https\nhost=github.com\n\n");
+    }
+  });
+  return password || process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim() || null;
+}
+
+const TokenRepositorySchema = z.object({
+  node_id: z.string(),
+  name: z.string(),
+  full_name: z.string(),
+  description: z.string().nullable(),
+  private: z.boolean(),
+  updated_at: z.string(),
+  ssh_url: z.string(),
+  clone_url: z.string(),
+});
+
+async function listTokenRepositories(token: string, request: typeof fetch) {
+  const repositories: z.infer<typeof TokenRepositorySchema>[] = [];
+  const signal = AbortSignal.timeout(15_000);
+  // Bound discovery at 1,000 repositories. Refuse partial results instead of
+  // making a repository past the cap appear inaccessible.
+  for (let page = 1; page <= 10; page++) {
+    let response: Response;
+    try {
+      response = await request(
+        `https://api.github.com/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=100&page=${page}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+          redirect: "error",
+          signal,
+        },
+      );
+    } catch {
+      throw new Error(
+        "GitHub repository listing failed. Check the host network connection and retry.",
+      );
+    }
+    if (response.status === 401) {
+      await response.body?.cancel();
+      throw new GitHubAuthenticationError({
+        stderr: "GitHub rejected the configured repository credential.",
+      });
+    }
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error(
+        `GitHub repository listing failed (HTTP ${response.status}). Check token access and rate limits.`,
+      );
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("GitHub returned an empty repository response.");
+    let bytes = 0;
+    const chunks: Uint8Array[] = [];
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > 4 * 1024 * 1024) throw new Error("response too large");
+        chunks.push(value);
+      }
+      const parsed = z
+        .array(TokenRepositorySchema)
+        .parse(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      repositories.push(...parsed);
+    } catch {
+      await reader.cancel().catch(() => undefined);
+      throw new Error("GitHub returned an invalid or incomplete repository response.");
+    } finally {
+      reader.releaseLock();
+    }
+    if (!response.headers.get("link")?.includes('rel="next"')) return repositories;
+  }
+  throw new Error(
+    "GitHub repository discovery exceeded 1,000 repositories. Enter the repository URL directly.",
+  );
 }

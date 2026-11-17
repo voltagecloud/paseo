@@ -7693,9 +7693,11 @@ export class Session {
       const commandError = error instanceof GitHubCommandError ? error.stderr.trim() : "";
       let message: string;
       if (missing) {
-        message = "GitHub CLI (gh) is not installed or not in PATH";
+        message =
+          "GitHub repository search is unavailable. Configure git credentials for github.com or set GH_TOKEN/GITHUB_TOKEN on the host.";
       } else if (unauthenticated) {
-        message = "GitHub CLI is not authenticated. Run gh auth login on the host.";
+        message =
+          "GitHub authentication failed. Check git credentials for github.com, GH_TOKEN/GITHUB_TOKEN, or run gh auth login on the host.";
       } else if (commandError) {
         message = commandError;
       } else {
