@@ -285,6 +285,17 @@ describe("token repository discovery", () => {
     }
   });
 
+  it("accepts managed-user owner names", async () => {
+    const service = createGitHubService({
+      resolveRepositoryToken: async () => "test-token",
+      resolveGhPath: async () => null,
+      repositoryFetch: async () =>
+        Response.json([{ ...apiRepository, full_name: "octo_corp/repo", name: "repo" }]),
+    });
+    const result = await service.searchRepositories({ cwd: "/tmp", query: "octo_corp" });
+    expect(result.map((repo) => repo.nameWithOwner)).toEqual(["octo_corp/repo"]);
+  });
+
   it("sanitizes network failures", async () => {
     const service = createGitHubService({
       resolveRepositoryToken: async () => "test-token",

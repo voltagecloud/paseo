@@ -4389,7 +4389,7 @@ export async function resolveRepositoryToken(cwd: string): Promise<string | null
 const TokenRepositorySchema = z.object({
   node_id: z.string(),
   name: z.string().regex(/^[A-Za-z0-9_.-]+$/),
-  full_name: z.string().regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/),
+  full_name: z.string().regex(/^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/),
   description: z.string().nullable(),
   private: z.boolean(),
   updated_at: z.string(),
