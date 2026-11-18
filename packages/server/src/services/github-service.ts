@@ -4319,21 +4319,21 @@ export async function resolveRepositoryToken(cwd: string): Promise<string | null
     const exited = new Promise<void>((resolve) => {
       markExited = resolve;
     });
+    const spawnCredential =
+      process.platform === "win32" ? spawnWindowsCredentialProcess : spawnProcess;
+    const child = spawnCredential("git", ["credential", "fill"], {
+      cwd,
+      shell: false,
+      detached: process.platform !== "win32",
+      envOverlay: {
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_ASKPASS: "",
+        SSH_ASKPASS: "",
+        GCM_INTERACTIVE: "never",
+      },
+      stdio: ["pipe", "pipe", "ignore"],
+    });
     const result = new Promise<string | null>((resolve) => {
-      const spawnCredential =
-        process.platform === "win32" ? spawnWindowsCredentialProcess : spawnProcess;
-      const child = spawnCredential("git", ["credential", "fill"], {
-        cwd,
-        shell: false,
-        detached: process.platform !== "win32",
-        envOverlay: {
-          GIT_TERMINAL_PROMPT: "0",
-          GIT_ASKPASS: "",
-          SSH_ASKPASS: "",
-          GCM_INTERACTIVE: "never",
-        },
-        stdio: ["pipe", "pipe", "ignore"],
-      });
       child.once("close", markExited);
       let output = "";
       let settled = false;
@@ -4388,8 +4388,8 @@ export async function resolveRepositoryToken(cwd: string): Promise<string | null
 
 const TokenRepositorySchema = z.object({
   node_id: z.string(),
-  name: z.string(),
-  full_name: z.string(),
+  name: z.string().regex(/^[A-Za-z0-9_.-]+$/),
+  full_name: z.string().regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/),
   description: z.string().nullable(),
   private: z.boolean(),
   updated_at: z.string(),
@@ -4404,13 +4404,14 @@ async function listTokenRepositories(
   limit: number,
 ) {
   const repositories: z.infer<typeof TokenRepositorySchema>[] = [];
+  const deadline = performance.now() + 15_000;
   const signal = AbortSignal.timeout(15_000);
   // A successful scoped listing is authoritative, even for nonempty queries.
   // Never broaden discovery beyond the repositories visible to this credential.
   const needle = query.toLowerCase();
   const seen = new Set<string>();
   for (let page = 1; ; page++) {
-    checkRepositoryDeadline(signal);
+    checkRepositoryDeadline(signal, deadline);
     let response: Response;
     try {
       response = await request(
@@ -4426,7 +4427,7 @@ async function listTokenRepositories(
         },
       );
     } catch {
-      checkRepositoryDeadline(signal);
+      checkRepositoryDeadline(signal, deadline);
       throw new Error(
         "GitHub repository listing failed. Check the host network connection and retry.",
       );
@@ -4459,6 +4460,7 @@ async function listTokenRepositories(
         .array(TokenRepositorySchema)
         .parse(JSON.parse(Buffer.concat(chunks).toString("utf8")));
       for (const repo of parsed) {
+        checkRepositoryDeadline(signal, deadline);
         if (seen.has(repo.node_id)) continue;
         if (
           [repo.name, repo.full_name, repo.description ?? ""].some((value) =>
@@ -4471,17 +4473,18 @@ async function listTokenRepositories(
       }
     } catch {
       await reader.cancel().catch(() => undefined);
-      checkRepositoryDeadline(signal);
+      checkRepositoryDeadline(signal, deadline);
       throw new Error("GitHub returned an invalid or incomplete repository response.");
     } finally {
       reader.releaseLock();
     }
+    checkRepositoryDeadline(signal, deadline);
     if (repositories.length >= limit || !response.headers.get("link")?.includes('rel="next"'))
       return repositories.slice(0, limit);
   }
 }
 
-function checkRepositoryDeadline(signal: AbortSignal): void {
-  if (signal.aborted)
+function checkRepositoryDeadline(signal: AbortSignal, deadline: number): void {
+  if (signal.aborted || performance.now() >= deadline)
     throw new Error("GitHub repository search timed out before completion. Retry the search.");
 }

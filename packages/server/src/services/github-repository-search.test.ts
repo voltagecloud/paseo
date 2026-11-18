@@ -252,6 +252,39 @@ describe("token repository discovery", () => {
     );
   });
 
+  it.each(["sensitive-invalid-name", "/repo", "owner/", "owner/repo/extra"])(
+    "sanitizes malformed repository identity %s",
+    async (full_name) => {
+      const service = createGitHubService({
+        resolveRepositoryToken: async () => "test-token",
+        resolveGhPath: async () => null,
+        repositoryFetch: async () => Response.json([{ ...apiRepository, full_name }]),
+      });
+      await expect(service.searchRepositories({ cwd: "/tmp", query: "" })).rejects.toThrow(
+        "GitHub returned an invalid or incomplete repository response.",
+      );
+    },
+  );
+
+  it("checks the monotonic deadline before returning the final page", async () => {
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    const service = createGitHubService({
+      resolveRepositoryToken: async () => "test-token",
+      resolveGhPath: async () => null,
+      repositoryFetch: async () => {
+        clock.mockReturnValue(15_001);
+        return Response.json([apiRepository]);
+      },
+    });
+    try {
+      await expect(service.searchRepositories({ cwd: "/tmp", query: "" })).rejects.toThrow(
+        "timed out before completion",
+      );
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("sanitizes network failures", async () => {
     const service = createGitHubService({
       resolveRepositoryToken: async () => "test-token",
@@ -523,3 +556,9 @@ holder.unref();
   },
   25_000,
 );
+
+it("releases scheduler admission after synchronous spawn failures", async () => {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    await expect(resolveRepositoryToken("invalid\0cwd")).rejects.toThrow();
+  }
+});
