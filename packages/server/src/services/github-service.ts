@@ -4386,16 +4386,20 @@ export async function resolveRepositoryToken(cwd: string): Promise<string | null
   return password || process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim() || null;
 }
 
-const TokenRepositorySchema = z.object({
-  node_id: z.string(),
-  name: z.string().regex(/^[A-Za-z0-9_.-]+$/),
-  full_name: z.string().regex(/^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/),
-  description: z.string().nullable(),
-  private: z.boolean(),
-  updated_at: z.string(),
-  ssh_url: z.string(),
-  clone_url: z.string(),
-});
+const TokenRepositorySchema = z
+  .object({
+    node_id: z.string(),
+    name: z.string().regex(/^[A-Za-z0-9_.-]+$/),
+    full_name: z.string().regex(/^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/),
+    description: z.string().nullable(),
+    private: z.boolean(),
+    updated_at: z.string(),
+    ssh_url: z.string(),
+    clone_url: z.string(),
+  })
+  .refine(
+    (repo) => repo.name !== "." && repo.name !== ".." && repo.full_name.split("/")[1] === repo.name,
+  );
 
 async function listTokenRepositories(
   token: string,

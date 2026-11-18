@@ -266,24 +266,42 @@ describe("token repository discovery", () => {
     },
   );
 
-  it("checks the monotonic deadline before returning the final page", async () => {
-    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+  it.each([
+    { name: "repo", full_name: "owner/other" },
+    { name: ".", full_name: "owner/." },
+    { name: "..", full_name: "owner/.." },
+  ])("sanitizes inconsistent or navigational identity $full_name", async (identity) => {
     const service = createGitHubService({
       resolveRepositoryToken: async () => "test-token",
       resolveGhPath: async () => null,
-      repositoryFetch: async () => {
-        clock.mockReturnValue(15_001);
-        return Response.json([apiRepository]);
-      },
+      repositoryFetch: async () => Response.json([{ ...apiRepository, ...identity }]),
     });
-    try {
-      await expect(service.searchRepositories({ cwd: "/tmp", query: "" })).rejects.toThrow(
-        "timed out before completion",
-      );
-    } finally {
-      clock.mockRestore();
-    }
+    await expect(service.searchRepositories({ cwd: "/tmp", query: "" })).rejects.toThrow(
+      "GitHub returned an invalid or incomplete repository response.",
+    );
   });
+
+  it.each([[], [apiRepository]])(
+    "checks the monotonic deadline before returning final page %j",
+    async (...items) => {
+      const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+      const service = createGitHubService({
+        resolveRepositoryToken: async () => "test-token",
+        resolveGhPath: async () => null,
+        repositoryFetch: async () => {
+          clock.mockReturnValue(15_001);
+          return Response.json(items);
+        },
+      });
+      try {
+        await expect(service.searchRepositories({ cwd: "/tmp", query: "" })).rejects.toThrow(
+          "timed out before completion",
+        );
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
 
   it("accepts managed-user owner names", async () => {
     const service = createGitHubService({
